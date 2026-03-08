@@ -1,0 +1,280 @@
+## Il Layer AI — l'analogia
+
+Pensa all'AI come a un **nuovo impiegato appena assunto**. Ogni volta che deve rispondere, tu gli consegni:
+
+1. Un **manuale aziendale** — le istruzioni fisse su come comportarsi
+2. Un **foglio aggiornamenti** — le direttive recenti del professionista
+3. Il **fascicolo del cliente** — la storia della conversazione fino ad ora
+4. Il **messaggio appena arrivato** — cosa sta chiedendo il cliente adesso
+
+L'impiegato legge tutto, risponde, e poi dimentica tutto. La prossima volta riceverà di nuovo tutto da zero. Questo è esattamente come funziona un LLM — **stateless per natura**, con memoria artificiale iniettata ad ogni chiamata.
+
+---
+
+## I tre compiti dell'AI
+
+Il layer AI deve fare tre cose distinte:
+
+```
+                    ┌─────────────────────────────┐
+Messaggio entra →   │  1. CLASSIFICATORE          │  → che tipo di messaggio è?
+                    │  2. RISPONDITORE AI          │  → risponde al cliente
+                    │  3. ESTRATTORE DIRETTIVE     │  → aggiorna il DB
+                    └─────────────────────────────┘
+```
+
+Ogni compito ha il suo prompt dedicato — è buona norma non mischiare responsabilità diverse nella stessa chiamata AI.
+
+---
+
+## 1. Il Classificatore
+
+Quando il **professionista** scrive sul Numero B, il sistema deve capire cosa vuole fare. Questo è il classificatore:
+
+```python
+async def classify_professional_message(text: str) -> dict:
+    response = await anthropic.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=200,
+        system="""Sei un classificatore di messaggi. Analizza il messaggio
+        del professionista e rispondi SOLO con un JSON, nessun testo extra.
+
+        Categorie possibili:
+        - "directive": aggiunge/modifica una regola di comportamento del bot
+        - "manual_reply": vuole rispondere manualmente a un cliente specifico
+        - "summary_request": chiede un riassunto dei messaggi recenti
+        - "question": fa una domanda generica sul sistema
+
+        Formato risposta:
+        {
+          "type": "directive|manual_reply|summary_request|question",
+          "target_client": "nome o numero cliente, solo per manual_reply, altrimenti null",
+          "content": "il contenuto pulito del messaggio"
+        }""",
+        messages=[{"role": "user", "content": text}]
+    )
+
+    import json
+    return json.loads(response.content[0].text)
+```
+
+**Esempio in azione:**
+
+| Messaggio professionista | Output classificatore |
+|---|---|
+| *"Da oggi non lavoro il sabato"* | `{"type": "directive", "target_client": null, "content": "..."}` |
+| *"Rispondi a Mario che il preventivo è pronto"* | `{"type": "manual_reply", "target_client": "Mario", "content": "..."}` |
+| *"Chi ha scritto oggi?"* | `{"type": "summary_request", ...}` |
+
+---
+
+## 2. Il Risponditore AI
+
+Questo è il cuore — risponde ai clienti usando direttive + storia conversazione:
+
+```python
+async def generate_client_response(
+    conversation_id: int,
+    client_name: str,
+    new_message: str
+) -> str:
+
+    # Recupera dal DB
+    directives = await get_active_directives()
+    history = await get_conversation_history(conversation_id, limit=10)
+
+    system_prompt = f"""Sei un assistente virtuale professionale e cordiale.
+Rispondi ai clienti a nome del professionista.
+
+## DIRETTIVE AGGIORNATE
+{directives}
+
+## COMPORTAMENTO GENERALE
+- Sii sempre educato e professionale
+- Se non sai rispondere a qualcosa, di' che riferirai al professionista
+- Non inventare informazioni che non hai
+- Il cliente si chiama {client_name}
+"""
+
+    # Costruisci i messaggi con la storia
+    messages = history + [{"role": "user", "content": new_message}]
+
+    response = await anthropic.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=500,
+        system=system_prompt,
+        messages=messages
+    )
+
+    return response.content[0].text
+```
+
+---
+
+## 3. L'Estrattore di Direttive
+
+Quando il classificatore identifica una direttiva, questo modulo la normalizza e la salva:
+
+```python
+async def extract_and_save_directive(raw_text: str):
+
+    # Chiedi all'AI di normalizzare la direttiva in linguaggio chiaro
+    response = await anthropic.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=200,
+        system="""Converti il messaggio in una direttiva chiara e concisa
+        per un assistente virtuale. Rispondi SOLO con un JSON:
+        {
+          "content": "direttiva normalizzata",
+          "expires_at": "ISO datetime o null se permanente"
+        }
+
+        Esempi:
+        Input: "questa settimana sono in ferie"
+        Output: {"content": "Il professionista è in ferie questa settimana, non fissare appuntamenti", "expires_at": "2024-01-21T23:59:59"}
+
+        Input: "il prezzo base è 80 euro"
+        Output: {"content": "Il prezzo della consulenza base è 80€", "expires_at": null}
+        """,
+        messages=[{"role": "user", "content": raw_text}]
+    )
+
+    import json
+    directive = json.loads(response.content[0].text)
+
+    # Salva nel DB
+    await db.execute("""
+        INSERT INTO directives (content, expires_at)
+        VALUES ($1, $2)
+    """, directive["content"], directive.get("expires_at"))
+
+    return directive["content"]
+```
+
+---
+
+## Il Controller Principale
+
+Tutto si unisce qui — è il direttore d'orchestra che chiama i moduli giusti:
+
+```python
+async def process_incoming_message(
+    phone_number_id: str,
+    sender: str,
+    text: str,
+    message_id: str
+):
+    # ── Messaggio dal PROFESSIONISTA (Numero B) ──
+    if phone_number_id == PROF_PHONE_NUMBER_ID:
+
+        classification = await classify_professional_message(text)
+
+        if classification["type"] == "directive":
+            saved = await extract_and_save_directive(text)
+            await send_whatsapp_message(
+                PROF_WA_ID,
+                f"✅ Direttiva salvata:\n_{saved}_"
+            )
+
+        elif classification["type"] == "manual_reply":
+            client = await find_client_by_name(classification["target_client"])
+            if client:
+                conv = await get_active_conversation(client["id"])
+                await send_whatsapp_message(client["wa_id"], classification["content"])
+                await save_message(conv["id"], "professional", classification["content"])
+                await send_whatsapp_message(PROF_WA_ID, "✅ Messaggio inviato")
+            else:
+                await send_whatsapp_message(PROF_WA_ID, "⚠️ Cliente non trovato")
+
+        elif classification["type"] == "summary_request":
+            summary = await generate_daily_summary()
+            await send_whatsapp_message(PROF_WA_ID, summary)
+
+    # ── Messaggio da un CLIENTE (Numero A) ──
+    else:
+        client = await get_or_create_client(sender)
+        conv = await get_or_create_conversation(client["id"])
+
+        # Salva messaggio cliente
+        await save_message(conv["id"], "client", text, message_id)
+
+        # Genera risposta AI
+        ai_response = await generate_client_response(
+            conv["id"], client["name"] or sender, text
+        )
+
+        # Invia risposta al cliente
+        await send_whatsapp_message(sender, ai_response)
+
+        # Salva risposta bot
+        await save_message(conv["id"], "bot", ai_response)
+
+        # Notifica al professionista (opzionale, solo per messaggi importanti)
+        await maybe_notify_professional(client, text, ai_response)
+```
+
+---
+
+## La notifica intelligente al professionista
+
+Non vuoi essere sommerso di notifiche. L'AI decide da sola se un messaggio merita attenzione:
+
+```python
+async def maybe_notify_professional(client, client_msg: str, bot_reply: str):
+
+    response = await anthropic.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=100,
+        system="""Rispondi SOLO con JSON.
+        Decidi se questo scambio richiede attenzione del professionista.
+        Casi che richiedono notifica: urgenza, reclami, richieste complesse,
+        importi elevati, situazioni ambigue.
+        {"notify": true/false, "reason": "motivazione breve o null"}
+        """,
+        messages=[{"role": "user", "content":
+            f"Messaggio cliente: {client_msg}\nRisposta bot: {bot_reply}"
+        }]
+    )
+
+    import json
+    result = json.loads(response.content[0].text)
+
+    if result["notify"]:
+        await send_whatsapp_message(
+            PROF_WA_ID,
+            f"⚠️ *Attenzione richiesta*\n"
+            f"Cliente: {client['name'] or client['wa_id']}\n"
+            f"Motivo: {result['reason']}\n\n"
+            f"Messaggio: _{client_msg}_"
+        )
+```
+
+---
+
+## Schema visivo del layer AI
+
+```
+Messaggio in arrivo
+        │
+        ▼
+┌───────────────┐     Numero B      ┌─────────────────────┐
+│    Webhook    │ ─────────────── → │   CLASSIFICATORE    │
+│   receiver    │                   │  directive?         │ → Estrattore direttive → DB
+└───────┬───────┘                   │  manual_reply?      │ → Invia a cliente
+        │ Numero A                  │  summary_request?   │ → Genera riassunto
+        ▼                           └─────────────────────┘
+┌───────────────┐
+│  RISPONDITORE │ ← direttive dal DB
+│      AI       │ ← storia conversazione dal DB
+└───────┬───────┘
+        │
+        ├──→ Risposta al cliente (Numero A)
+        │
+        └──→ Notifica professionista? (Numero B)
+                    ↑
+             NOTIFICA INTELLIGENTE
+```
+
+---
+
+Ora hai tutti e tre i pezzi fondamentali: **webhook → database → AI**. Il passo successivo naturale è **come inviare i messaggi** (`send_whatsapp_message`) tramite la Meta API, e poi mettere tutto insieme in un server funzionante. Vuoi continuare da lì?

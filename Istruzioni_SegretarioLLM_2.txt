@@ -1,0 +1,209 @@
+## Il Database — l'analogia
+
+Pensa al database come all'**archivio fisico di uno studio professionale**:
+
+- Un raccoglitore per ogni **cliente** (chi sei, da dove chiami)
+- Un registro cronologico di ogni **conversazione** (quando, con chi, cosa si è detto)
+- Un quaderno delle **direttive** del professionista (le istruzioni aggiornabili)
+- Un blocco note per le **risposte in sospeso** (messaggi che aspettano azione)
+
+Ogni raccoglitore si collega agli altri tramite un codice identificativo — in database si chiamano **foreign keys**.
+
+---
+
+## Le 4 tabelle fondamentali
+
+### 1. `clients` — chi sono i tuoi clienti
+```sql
+CREATE TABLE clients (
+    id          SERIAL PRIMARY KEY,
+    wa_id       VARCHAR(20) UNIQUE NOT NULL,  -- es. "393331234567"
+    name        VARCHAR(100),                 -- da WhatsApp profile
+    created_at  TIMESTAMP DEFAULT NOW(),
+    notes       TEXT                          -- note manuali del professionista
+);
+```
+
+### 2. `conversations` — ogni thread con un cliente
+```sql
+CREATE TABLE conversations (
+    id          SERIAL PRIMARY KEY,
+    client_id   INTEGER REFERENCES clients(id),
+    started_at  TIMESTAMP DEFAULT NOW(),
+    last_msg_at TIMESTAMP DEFAULT NOW(),
+    status      VARCHAR(20) DEFAULT 'active',
+    -- 'active' | 'resolved' | 'waiting_prof'
+    summary     TEXT        -- riassunto generato dall'AI
+);
+```
+
+### 3. `messages` — ogni singolo messaggio
+```sql
+CREATE TABLE messages (
+    id              SERIAL PRIMARY KEY,
+    conversation_id INTEGER REFERENCES conversations(id),
+    wa_message_id   VARCHAR(100) UNIQUE,  -- per evitare duplicati
+    role            VARCHAR(20) NOT NULL,
+    -- 'client' | 'bot' | 'professional'
+    content         TEXT NOT NULL,
+    timestamp       TIMESTAMP DEFAULT NOW(),
+    is_processed    BOOLEAN DEFAULT FALSE
+);
+```
+
+### 4. `directives` — le istruzioni aggiornabili del professionista
+```sql
+CREATE TABLE directives (
+    id          SERIAL PRIMARY KEY,
+    content     TEXT NOT NULL,        -- "Non faccio appuntamenti il venerdì"
+    is_active   BOOLEAN DEFAULT TRUE,
+    created_at  TIMESTAMP DEFAULT NOW(),
+    expires_at  TIMESTAMP            -- NULL = valida per sempre
+);
+```
+
+---
+
+## Come le tabelle si collegano
+
+```
+clients (1)
+    └──→ conversations (N)       -- un cliente può avere più conversazioni
+              └──→ messages (N)  -- ogni conversazione ha molti messaggi
+
+directives                       -- tabella indipendente, letta dall'AI
+```
+
+È una relazione **uno-a-molti** a cascata. Come i fascicoli di un cliente in uno studio legale: un cliente → molte pratiche → molti documenti per pratica.
+
+---
+
+## Il flusso dati in pratica
+
+Quando arriva un messaggio da un cliente, il tuo backend esegue questa sequenza:
+
+```python
+async def handle_client_message(sender: str, text: str, message_id: str):
+
+    # 1. Evita duplicati
+    if await is_duplicate(message_id):
+        return
+
+    # 2. Trova o crea il cliente
+    client = await db.fetchrow(
+        "SELECT * FROM clients WHERE wa_id = $1", sender
+    )
+    if not client:
+        client = await db.fetchrow(
+            "INSERT INTO clients (wa_id) VALUES ($1) RETURNING *", sender
+        )
+
+    # 3. Trova conversazione attiva o creane una nuova
+    conversation = await db.fetchrow("""
+        SELECT * FROM conversations
+        WHERE client_id = $1 AND status = 'active'
+        ORDER BY last_msg_at DESC LIMIT 1
+    """, client["id"])
+
+    if not conversation:
+        conversation = await db.fetchrow("""
+            INSERT INTO conversations (client_id) VALUES ($1) RETURNING *
+        """, client["id"])
+
+    # 4. Salva il messaggio
+    await db.execute("""
+        INSERT INTO messages (conversation_id, wa_message_id, role, content)
+        VALUES ($1, $2, 'client', $3)
+    """, conversation["id"], message_id, text)
+
+    # 5. Aggiorna timestamp conversazione
+    await db.execute("""
+        UPDATE conversations SET last_msg_at = NOW() WHERE id = $1
+    """, conversation["id"])
+
+    # 6. Passa all'AI (prossimo step)
+    await process_with_ai(conversation["id"], client, text)
+```
+
+---
+
+## Come vengono lette le direttive dall'AI
+
+Ogni volta che l'AI deve rispondere, legge tutte le direttive attive e le inietta nel system prompt:
+
+```python
+async def get_active_directives() -> str:
+    directives = await db.fetch("""
+        SELECT content FROM directives
+        WHERE is_active = TRUE
+          AND (expires_at IS NULL OR expires_at > NOW())
+        ORDER BY created_at DESC
+    """)
+
+    if not directives:
+        return "Nessuna direttiva specifica."
+
+    lines = [f"- {d['content']}" for d in directives]
+    return "\n".join(lines)
+```
+
+Il risultato è una stringa tipo:
+```
+- Non fare appuntamenti il venerdì
+- Il prezzo della consulenza base è 80€
+- Se il cliente chiede urgenza, avvisa sempre il professionista
+```
+
+Questa stringa entra direttamente nel system prompt dell'AI — che così risponde sempre in modo aggiornato.
+
+---
+
+## La storia della conversazione per l'AI
+
+L'AI ha bisogno del contesto degli ultimi messaggi per rispondere in modo coerente. Non puoi passarle tutta la storia (troppo lunga), quindi prendi gli ultimi N messaggi:
+
+```python
+async def get_conversation_history(conversation_id: int, limit: int = 10):
+    messages = await db.fetch("""
+        SELECT role, content FROM messages
+        WHERE conversation_id = $1
+        ORDER BY timestamp DESC
+        LIMIT $2
+    """, conversation_id, limit)
+
+    # Rovescia l'ordine (dal più vecchio al più recente)
+    return [
+        {"role": "user" if m["role"] == "client" else "assistant",
+         "content": m["content"]}
+        for m in reversed(messages)
+    ]
+```
+
+---
+
+## Schema visivo completo
+
+```
+┌─────────────┐       ┌──────────────────┐       ┌─────────────────┐
+│   clients   │ 1───N │  conversations   │ 1───N │    messages     │
+│─────────────│       │──────────────────│       │─────────────────│
+│ id          │       │ id               │       │ id              │
+│ wa_id       │       │ client_id (FK)   │       │ conversation_id │
+│ name        │       │ status           │       │ wa_message_id   │
+│ notes       │       │ summary          │       │ role            │
+└─────────────┘       │ last_msg_at      │       │ content         │
+                      └──────────────────┘       │ timestamp       │
+                                                  └─────────────────┘
+┌──────────────────┐
+│   directives     │  ← letta dall'AI ad ogni risposta
+│──────────────────│
+│ id               │
+│ content          │
+│ is_active        │
+│ expires_at       │
+└──────────────────┘
+```
+
+---
+
+Ora abbiamo webhook + database. Il prossimo pezzo è il **layer AI** — dove tutto si unisce: la storia della conversazione, le direttive attive, e il classificatore dei comandi del professionista. Procediamo?

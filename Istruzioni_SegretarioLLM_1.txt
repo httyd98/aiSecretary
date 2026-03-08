@@ -1,0 +1,158 @@
+## Cos'è un Webhook — l'analogia
+
+Immagina il tuo sistema come un **appartamento con un citofono**.
+
+Senza webhook, il tuo server dovrebbe continuamente affacciarsi dalla finestra per vedere se è arrivato qualcuno — ogni secondo, ogni ora, anche di notte. È inefficiente e dispendioso. Questo si chiama **polling**.
+
+Con il webhook invece, **è WhatsApp che suona il citofono** ogni volta che arriva un messaggio. Il tuo server aspetta tranquillo, e interviene solo quando viene chiamato.
+
+---
+
+## Il flusso tecnico passo per passo
+
+```
+[Cliente scrive "Ciao"]
+        ↓
+[Server WhatsApp/Meta]
+        ↓  HTTP POST (JSON)
+[Il tuo server — endpoint /webhook]
+        ↓
+[Estrai dati dal JSON]
+        ↓
+[Salva nel DB / Passa all'AI / Rispondi]
+```
+
+Quando il cliente manda un messaggio, Meta fa una **richiesta HTTP POST** al tuo server, su un endpoint che tu definisci — tipicamente `/webhook`. Il corpo della richiesta è un JSON con tutti i dettagli del messaggio.
+
+---
+
+## Come appare il JSON in arrivo
+
+Questo è il payload reale che Meta ti manda:
+
+```json
+{
+  "object": "whatsapp_business_account",
+  "entry": [{
+    "id": "WHATSAPP_BUSINESS_ACCOUNT_ID",
+    "changes": [{
+      "value": {
+        "messaging_product": "whatsapp",
+        "metadata": {
+          "display_phone_number": "+39012345678",  // Numero A o B
+          "phone_number_id": "PHONE_NUMBER_ID"
+        },
+        "contacts": [{
+          "profile": { "name": "Mario Rossi" },
+          "wa_id": "393331234567"  // Numero del mittente
+        }],
+        "messages": [{
+          "from": "393331234567",
+          "id": "wamid.abc123",   // ID univoco del messaggio
+          "timestamp": "1234567890",
+          "type": "text",
+          "text": { "body": "Ciao, sono disponibile giovedì?" }
+        }]
+      },
+      "field": "messages"
+    }]
+  }]
+}
+```
+
+I campi chiave che userai sempre sono:
+- `metadata.phone_number_id` — capisci se il messaggio è arrivato sul Numero A (clienti) o Numero B (professionista)
+- `contacts[0].wa_id` — il numero del mittente
+- `messages[0].text.body` — il testo del messaggio
+- `messages[0].id` — l'ID univoco, utile per evitare di processare lo stesso messaggio due volte
+
+---
+
+## Il codice del webhook (Python + FastAPI)
+
+```python
+from fastapi import FastAPI, Request, HTTPException
+import hmac, hashlib, os
+
+app = FastAPI()
+
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")  # Token segreto che scegli tu
+PROF_PHONE_NUMBER_ID = os.getenv("PROF_PHONE_NUMBER_ID")  # ID del Numero B
+
+# ─────────────────────────────────────────────
+# 1. VERIFICA INIZIALE (si fa una volta sola)
+# Meta chiama questo endpoint per verificare che il server sia tuo
+# ─────────────────────────────────────────────
+@app.get("/webhook")
+async def verify_webhook(
+    hub_mode: str,
+    hub_verify_token: str,
+    hub_challenge: str
+):
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        return int(hub_challenge)  # Rispondo con la challenge → Meta si fida
+    raise HTTPException(status_code=403, detail="Token non valido")
+
+
+# ─────────────────────────────────────────────
+# 2. RICEZIONE MESSAGGI (chiamato ad ogni messaggio)
+# ─────────────────────────────────────────────
+@app.post("/webhook")
+async def receive_message(request: Request):
+    body = await request.json()
+
+    # Naviga la struttura JSON annidata
+    entry = body.get("entry", [])[0]
+    change = entry.get("changes", [])[0]["value"]
+
+    # Ignora notifiche di stato (delivered, read, ecc.)
+    if "messages" not in change:
+        return {"status": "ignored"}
+
+    message = change["messages"][0]
+    phone_number_id = change["metadata"]["phone_number_id"]
+    sender = message["from"]
+    text = message.get("text", {}).get("body", "")
+    message_id = message["id"]
+
+    # Capisce da quale numero è arrivato il messaggio
+    if phone_number_id == PROF_PHONE_NUMBER_ID:
+        await handle_professional_message(sender, text, message_id)
+    else:
+        await handle_client_message(sender, text, message_id)
+
+    return {"status": "ok"}
+
+
+async def handle_client_message(sender, text, message_id):
+    # Qui salvi nel DB e passi all'AI
+    print(f"Messaggio da cliente {sender}: {text}")
+    # TODO: salva nel DB, chiama LLM, rispondi
+
+async def handle_professional_message(sender, text, message_id):
+    # Qui classifichi il comando del professionista
+    print(f"Comando del professionista: {text}")
+    # TODO: classifica (direttiva / risposta manuale / richiesta riassunto)
+```
+
+---
+
+## La verifica iniziale — perché esiste
+
+Quando registri il tuo webhook su Meta, loro fanno prima una **GET** al tuo endpoint con una `hub_challenge` — un numero random. Se il tuo server risponde con quel numero, Meta capisce che il server è davvero tuo e non di qualcun altro. È un handshake di fiducia, fatto una volta sola.
+
+---
+
+## Il problema dei duplicati
+
+WhatsApp a volte rimanda lo stesso messaggio se non riceve risposta entro pochi secondi. Per questo ogni messaggio ha un `id` univoco (`wamid.xxx`). La best practice è salvare questi ID nel DB e ignorare i messaggi già processati:
+
+```python
+async def is_duplicate(message_id: str) -> bool:
+    # Cerca nel DB se questo ID è già stato processato
+    return await db.messages.find_one({"message_id": message_id}) is not None
+```
+
+---
+
+Il prossimo pezzo naturale è il **database** — come strutturare le tabelle per conversazioni, direttive e messaggi. Oppure possiamo saltare direttamente al **layer AI** con il classificatore dei comandi. Cosa preferisci?
