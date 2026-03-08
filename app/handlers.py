@@ -13,23 +13,22 @@ from app import whatsapp
 
 
 async def process_incoming_message(
-    phone_number_id: str,
     sender: str,
     text: str,
     message_id: str,
 ) -> None:
     """
     Entry point per ogni messaggio ricevuto dal webhook.
-    Distingue tra messaggi del professionista (Numero B) e dei clienti (Numero A).
+    Distingue il professionista dai clienti in base al wa_id del mittente.
     """
-    if phone_number_id == settings.prof_phone_number_id:
+    if sender == settings.prof_wa_id:
         await handle_professional_message(sender, text, message_id)
     else:
         await handle_client_message(sender, text, message_id)
 
 
 # ──────────────────────────────────────────────
-# Messaggi del professionista (Numero B)
+# Messaggi del professionista
 # ──────────────────────────────────────────────
 
 async def handle_professional_message(
@@ -88,7 +87,7 @@ async def handle_professional_message(
 
 
 # ──────────────────────────────────────────────
-# Messaggi dei clienti (Numero A)
+# Messaggi dei clienti
 # ──────────────────────────────────────────────
 
 async def handle_client_message(

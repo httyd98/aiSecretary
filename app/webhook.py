@@ -48,7 +48,6 @@ async def receive_message(request: Request):
             return {"status": "ignored"}
 
         message = change["messages"][0]
-        phone_number_id = change["metadata"]["phone_number_id"]
         sender = message["from"]
         text = message.get("text", {}).get("body", "")
         message_id = message["id"]
@@ -63,7 +62,7 @@ async def receive_message(request: Request):
 
         # Smista al handler appropriato (in background per rispondere subito a Meta)
         asyncio.create_task(
-            process_incoming_message(phone_number_id, sender, text, message_id)
+            process_incoming_message(sender, text, message_id)
         )
 
     except (KeyError, IndexError) as e:

@@ -10,9 +10,8 @@ class Settings(BaseSettings):
     # WhatsApp / Meta
     whatsapp_token: str
     verify_token: str
-    client_phone_number_id: str
-    prof_phone_number_id: str
-    prof_wa_id: str  # Numero WhatsApp del professionista (es. "393331234567")
+    phone_number_id: str  # L'unico numero API (quello del bot)
+    prof_wa_id: str  # Numero WhatsApp personale del professionista (es. "393331234567")
 
     # Anthropic
     anthropic_api_key: str

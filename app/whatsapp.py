@@ -21,17 +21,9 @@ def _auth_headers() -> dict:
     }
 
 
-async def send_whatsapp_message(
-    to: str,
-    text: str,
-    phone_number_id: str | None = None,
-) -> bool:
-    """
-    Invia un messaggio di testo semplice.
-    Di default usa il Numero A (clienti); passa `phone_number_id` per usare il Numero B.
-    """
-    sender_id = phone_number_id or settings.client_phone_number_id
-    url = f"{GRAPH_BASE_URL}/{sender_id}/messages"
+async def send_whatsapp_message(to: str, text: str) -> bool:
+    """Invia un messaggio di testo semplice tramite l'unico numero API."""
+    url = f"{GRAPH_BASE_URL}/{settings.phone_number_id}/messages"
 
     payload = {
         "messaging_product": "whatsapp",
@@ -52,12 +44,8 @@ async def send_whatsapp_message(
 
 
 async def send_to_professional(text: str) -> bool:
-    """Shortcut per mandare un messaggio al professionista sul Numero B."""
-    return await send_whatsapp_message(
-        to=settings.prof_wa_id,
-        text=text,
-        phone_number_id=settings.prof_phone_number_id,
-    )
+    """Shortcut per mandare un messaggio al professionista."""
+    return await send_whatsapp_message(to=settings.prof_wa_id, text=text)
 
 
 async def send_formatted_summary(to: str, messages_list: list[dict]) -> bool:
@@ -78,17 +66,13 @@ async def send_formatted_summary(to: str, messages_list: list[dict]) -> bool:
 
 
 async def send_message_with_buttons(
-    to: str,
-    body: str,
-    buttons: list[dict],
-    phone_number_id: str | None = None,
+    to: str, body: str, buttons: list[dict]
 ) -> bool:
     """
     Invia un messaggio con pulsanti interattivi (max 3).
     `buttons` è lista di dict con chiavi: id, title.
     """
-    sender_id = phone_number_id or settings.client_phone_number_id
-    url = f"{GRAPH_BASE_URL}/{sender_id}/messages"
+    url = f"{GRAPH_BASE_URL}/{settings.phone_number_id}/messages"
 
     payload = {
         "messaging_product": "whatsapp",
@@ -137,7 +121,7 @@ async def _send_template_message(to: str, template_name: str) -> bool:
     Invia un template message pre-approvato da Meta.
     Richiede che il template sia stato creato e approvato nella Meta dashboard.
     """
-    url = f"{GRAPH_BASE_URL}/{settings.client_phone_number_id}/messages"
+    url = f"{GRAPH_BASE_URL}/{settings.phone_number_id}/messages"
 
     payload = {
         "messaging_product": "whatsapp",
